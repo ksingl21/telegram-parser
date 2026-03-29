@@ -1,0 +1,4 @@
+telethon
+openpyxl
+ollama
+python-dotenv
