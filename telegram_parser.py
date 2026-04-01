@@ -3,6 +3,7 @@ import re
 import json
 import os
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 import ollama
@@ -145,7 +146,7 @@ Answer:"""
         return False
 
 
-async def fetch_messages(client, group: str, friend: str, since: datetime | None = None) -> list[dict]:
+async def fetch_messages(client, group: str, friend: str, since: Optional[datetime] = None) -> list[dict]:
     """Fetch messages from `friend` in `group`, optionally only after `since`."""
     print(f"Looking up group: {group}")
     entity = await find_group(client, group)
@@ -333,7 +334,7 @@ def build_excel(rows: list[dict], output_path: str):
     print(f"\nSaved → {output_path}")
 
 
-def load_last_run() -> datetime | None:
+def load_last_run() -> Optional[datetime]:
     """Load the timestamp of the last fetched message."""
     if os.path.exists(LAST_RUN):
         with open(LAST_RUN) as f:
