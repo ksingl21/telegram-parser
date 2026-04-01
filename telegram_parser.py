@@ -2,7 +2,7 @@ import asyncio
 import re
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 import ollama
@@ -19,6 +19,7 @@ API_HASH  = os.getenv("API_HASH")  # set in .env
 GROUP     = "crossfit"
 FRIEND    = "nkabir6202"
 OUTPUT    = "/Users/kapilsingla/Documents/crossfit_messages.xlsx"
+LAST_RUN  = "/Users/kapilsingla/Documents/telegram-parser/last_run.json"
 MODEL     = "llama3.2"
 
 KNOWN_THEMES = [
@@ -104,21 +105,75 @@ Only theme names, no explanation."""
         return []
 
 
-async def fetch_messages(client, group: str, friend: str) -> list[dict]:
-    """Fetch all messages from `friend` in `group`."""
+async def find_group(client, group_name: str):
+    """Find a private or public group by title or username."""
+    # Try by username first (public groups)
+    try:
+        return await client.get_entity(group_name)
+    except Exception:
+        pass
+    # Search through all dialogs for a matching title
+    print(f"  Searching dialogs for '{group_name}'...")
+    async for dialog in client.iter_dialogs():
+        if dialog.name and group_name.lower() in dialog.name.lower():
+            print(f"  Found: '{dialog.name}' (id={dialog.id})")
+            return dialog.entity
+    raise ValueError(f"Could not find any group matching '{group_name}'")
+
+
+def is_conversational(text: str) -> bool:
+    """Use Ollama to determine if a message is casual conversation vs a real post/share."""
+    prompt = f"""Is the following Telegram message a casual conversational reply (e.g. "ok", "thanks",
+"sure", "haha", tagging someone to chat, asking a question in response to someone, small talk)
+OR is it a standalone post sharing information, a link, article, book, or resource?
+
+Reply with only one word: "conversation" or "post".
+
+Message: {text[:500]}
+
+Answer:"""
+    try:
+        response = ollama.chat(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        answer = response["message"]["content"].strip().lower()
+        return "conversation" in answer
+    except Exception:
+        return False
+
+
+async def fetch_messages(client, group: str, friend: str, since: datetime | None = None) -> list[dict]:
+    """Fetch messages from `friend` in `group`, optionally only after `since`."""
     print(f"Looking up group: {group}")
-    entity = await client.get_entity(group)
+    entity = await find_group(client, group)
+
+    # resolve @mayanknyu to an ID so we can check reply targets
+    exclude_reply_to_user = None
+    try:
+        mayank = await client.get_entity("mayanknyu")
+        exclude_reply_to_user = mayank.id
+        print(f"  Will exclude replies to @mayanknyu (id={exclude_reply_to_user})")
+    except Exception:
+        print("  Could not resolve @mayanknyu — skipping that filter")
 
     print(f"Fetching messages from @{friend} ...")
     rows = []
-    async for msg in client.iter_messages(entity, from_user=friend, limit=None):
-        if not msg.text and not msg.media:
+    skipped_no_content = 0
+    skipped_reply = 0
+    skipped_conversational = 0
+
+    async for msg in client.iter_messages(entity, from_user=friend, limit=None,
+                                          offset_date=None,
+                                          reverse=False):
+        # skip messages older than last run
+        if since and msg.date.replace(tzinfo=timezone.utc) <= since.replace(tzinfo=timezone.utc):
             continue
 
         text = msg.text or ""
-        urls = URL_REGEX.findall(text)
 
-        # web preview / inline url
+        # extract urls from text and entities
+        urls = URL_REGEX.findall(text)
         if msg.entities:
             from telethon.tl.types import MessageEntityUrl, MessageEntityTextUrl
             for ent in msg.entities:
@@ -126,13 +181,35 @@ async def fetch_messages(client, group: str, friend: str) -> list[dict]:
                     urls.append(ent.url)
                 elif isinstance(ent, MessageEntityUrl):
                     urls.append(text[ent.offset: ent.offset + ent.length])
-
-        # deduplicate urls
         urls = list(dict.fromkeys(urls))
+
+        # check for attachment
+        has_attachment = isinstance(msg.media, MessageMediaDocument)
+
+        # ── Filter 1: must have a link or attachment ──────────────────────────
+        if not urls and not has_attachment:
+            skipped_no_content += 1
+            continue
+
+        # ── Filter 2: skip replies to @mayanknyu ─────────────────────────────
+        if exclude_reply_to_user and msg.reply_to:
+            try:
+                replied_msg = await msg.get_reply_message()
+                if replied_msg and replied_msg.sender_id == exclude_reply_to_user:
+                    skipped_reply += 1
+                    continue
+            except Exception:
+                pass
+
+        # ── Filter 3: skip pure conversation (Ollama check) ──────────────────
+        if text and is_conversational(text):
+            skipped_conversational += 1
+            print(f"  [skip-conv] {text[:80]}")
+            continue
 
         doc_name = ""
         doc_type = ""
-        if isinstance(msg.media, MessageMediaDocument):
+        if has_attachment:
             doc = msg.media.document
             for attr in doc.attributes:
                 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeAudio
@@ -160,7 +237,10 @@ async def fetch_messages(client, group: str, friend: str) -> list[dict]:
             "theme":    "",
         })
 
-    print(f"Fetched {len(rows)} messages.")
+    print(f"Fetched {len(rows)} messages "
+          f"(skipped: {skipped_no_content} no-link/attachment, "
+          f"{skipped_reply} replies-to-mayank, "
+          f"{skipped_conversational} conversational)")
     return rows
 
 
@@ -179,8 +259,8 @@ def build_excel(rows: list[dict], output_path: str):
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # sort by theme then date
-    rows_sorted = sorted(rows, key=lambda r: (r["theme"], r["date"]))
+    # sort by date descending (newest first)
+    rows_sorted = sorted(rows, key=lambda r: r["date"], reverse=True)
 
     for row_idx, r in enumerate(rows_sorted, start=2):
         fill = get_fill(r["theme"])
@@ -214,12 +294,68 @@ def build_excel(rows: list[dict], output_path: str):
     print(f"\nSaved → {output_path}")
 
 
+def load_last_run() -> datetime | None:
+    """Load the timestamp of the last fetched message."""
+    if os.path.exists(LAST_RUN):
+        with open(LAST_RUN) as f:
+            ts = json.load(f).get("last_message_time")
+            if ts:
+                return datetime.fromisoformat(ts)
+    return None
+
+
+def save_last_run(ts: datetime):
+    """Save the timestamp of the latest message fetched."""
+    with open(LAST_RUN, "w") as f:
+        json.dump({"last_message_time": ts.isoformat()}, f)
+
+
+def append_to_excel(rows: list[dict], output_path: str):
+    """Append new rows to existing Excel or create new one."""
+    if os.path.exists(output_path):
+        wb = openpyxl.load_workbook(output_path)
+        ws = wb["Messages by Theme"]
+    else:
+        build_excel(rows, output_path)
+        return
+
+    for r in rows:
+        fill = get_fill(r["theme"])
+        values = [r["date"], r["text"], r["theme"], r["urls"], r["doc_name"], r["doc_type"]]
+        row_idx = ws.max_row + 1
+        for col_idx, val in enumerate(values, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.fill = fill
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    # update summary sheet
+    from collections import Counter
+    ws2 = wb["Theme Summary"]
+    ws2.delete_rows(2, ws2.max_row)
+    all_rows = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row[2]:
+            all_rows.append(row[2])
+    counts = Counter(all_rows)
+    for theme, count in sorted(counts.items()):
+        ws2.append([theme, count])
+
+    wb.save(output_path)
+    print(f"Appended {len(rows)} new rows → {output_path}")
+
+
 async def main():
+    last_run = load_last_run()
+    if last_run:
+        print(f"Incremental run — fetching messages after {last_run.strftime('%Y-%m-%d %H:%M')}")
+    else:
+        print("First run — fetching all messages")
+
     async with TelegramClient("session_crossfit", API_ID, API_HASH) as client:
-        rows = await fetch_messages(client, GROUP, FRIEND)
+        rows = await fetch_messages(client, GROUP, FRIEND, since=last_run)
 
         if not rows:
-            print("No messages found. Check group name and username.")
+            print("No new messages found.")
             return
 
         # discover extra themes from a sample
@@ -227,7 +363,6 @@ async def main():
         texts = [r["text"] for r in rows if r["text"]]
         extra = discover_extra_themes(texts)
         all_themes = KNOWN_THEMES[:-1] + extra + ["Other"]  # keep Other last
-        # deduplicate
         seen = set()
         unique_themes = []
         for t in all_themes:
@@ -252,8 +387,15 @@ async def main():
             row["theme"] = classify_message(content, unique_themes)
             print(f"  [{i+1}/{len(rows)}] {row['theme'][:30]:<30} | {content[:60]}")
 
-        build_excel(rows, OUTPUT)
-        print("\nDone! Open crossfit_messages.xlsx")
+        if last_run:
+            append_to_excel(rows, OUTPUT)
+        else:
+            build_excel(rows, OUTPUT)
+
+        # save the timestamp of the most recent message
+        latest = max(datetime.fromisoformat(r["date"]) for r in rows)
+        save_last_run(latest.replace(tzinfo=timezone.utc))
+        print(f"\nDone! Last run saved as {latest.strftime('%Y-%m-%d %H:%M')}")
 
 
 if __name__ == "__main__":
