@@ -2,7 +2,7 @@ import asyncio
 import re
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 import ollama
@@ -18,8 +18,10 @@ API_ID    = os.getenv("API_ID")    # set in .env
 API_HASH  = os.getenv("API_HASH")  # set in .env
 GROUP     = "crossfit"
 FRIEND    = "nkabir6202"
-OUTPUT    = "/Users/kapilsingla/Documents/crossfit_messages.xlsx"
-LAST_RUN  = "/Users/kapilsingla/Documents/telegram-parser/last_run.json"
+OUTPUT       = "/Users/kapilsingla/Documents/crossfit_messages.xlsx"
+LAST_RUN     = "/Users/kapilsingla/Documents/telegram-parser/last_run.json"
+ATTACHMENTS  = "/Users/kapilsingla/Documents/telegram-attachments"
+TWO_YEARS_AGO = datetime(2024, 3, 31, tzinfo=timezone.utc)
 MODEL     = "llama3.2"
 
 KNOWN_THEMES = [
@@ -157,8 +159,17 @@ async def fetch_messages(client, group: str, friend: str, since: datetime | None
     except Exception:
         print("  Could not resolve @mayanknyu — skipping that filter")
 
-    print(f"Fetching messages from @{friend} ...")
+    os.makedirs(ATTACHMENTS, exist_ok=True)
+
+    # effective start date: whichever is more recent — 2 years ago or last run
+    cutoff = TWO_YEARS_AGO
+    if since:
+        since_utc = since.replace(tzinfo=timezone.utc)
+        cutoff = max(cutoff, since_utc)
+    print(f"Fetching messages from @{friend} after {cutoff.strftime('%Y-%m-%d')} ...")
+
     rows = []
+    skipped_old = 0
     skipped_no_content = 0
     skipped_reply = 0
     skipped_conversational = 0
@@ -166,8 +177,11 @@ async def fetch_messages(client, group: str, friend: str, since: datetime | None
     async for msg in client.iter_messages(entity, from_user=friend, limit=None,
                                           offset_date=None,
                                           reverse=False):
-        # skip messages older than last run
-        if since and msg.date.replace(tzinfo=timezone.utc) <= since.replace(tzinfo=timezone.utc):
+        msg_time = msg.date.replace(tzinfo=timezone.utc)
+
+        # stop once we go past the cutoff (messages come newest-first)
+        if msg_time <= cutoff:
+            skipped_old += 1
             continue
 
         text = msg.text or ""
@@ -209,10 +223,11 @@ async def fetch_messages(client, group: str, friend: str, since: datetime | None
 
         doc_name = ""
         doc_type = ""
+        doc_path = ""
         if has_attachment:
             doc = msg.media.document
+            from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeAudio
             for attr in doc.attributes:
-                from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeAudio
                 if hasattr(attr, "file_name") and attr.file_name:
                     doc_name = attr.file_name
                 if isinstance(attr, DocumentAttributeAudio):
@@ -228,17 +243,29 @@ async def fetch_messages(client, group: str, friend: str, since: datetime | None
                 else:
                     doc_type = "Document"
 
+            # build a safe filename using msg id + original name
+            safe_name = f"{msg.id}_{doc_name}" if doc_name else f"{msg.id}_attachment"
+            dest = os.path.join(ATTACHMENTS, safe_name)
+            if not os.path.exists(dest):
+                print(f"  Downloading: {safe_name}")
+                await client.download_media(msg, file=dest)
+            else:
+                print(f"  Already downloaded: {safe_name}")
+            doc_path = dest
+
         rows.append({
             "date":     msg.date.strftime("%Y-%m-%d %H:%M"),
             "text":     text,
             "urls":     "\n".join(urls),
             "doc_name": doc_name,
             "doc_type": doc_type,
+            "doc_path": doc_path,
             "theme":    "",
         })
 
     print(f"Fetched {len(rows)} messages "
-          f"(skipped: {skipped_no_content} no-link/attachment, "
+          f"(skipped: {skipped_old} too-old, "
+          f"{skipped_no_content} no-link/attachment, "
           f"{skipped_reply} replies-to-mayank, "
           f"{skipped_conversational} conversational)")
     return rows
@@ -249,7 +276,7 @@ def build_excel(rows: list[dict], output_path: str):
     ws = wb.active
     ws.title = "Messages by Theme"
 
-    headers = ["Date", "Message", "Theme", "URLs", "Document Name", "Doc Type"]
+    headers = ["Date", "Message", "Theme", "URLs", "Document Name", "Doc Type", "Attachment Link"]
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="2F4F4F", end_color="2F4F4F", fill_type="solid")
 
@@ -262,6 +289,8 @@ def build_excel(rows: list[dict], output_path: str):
     # sort by date descending (newest first)
     rows_sorted = sorted(rows, key=lambda r: r["date"], reverse=True)
 
+    link_font = Font(color="0000EE", underline="single")
+
     for row_idx, r in enumerate(rows_sorted, start=2):
         fill = get_fill(r["theme"])
         values = [r["date"], r["text"], r["theme"], r["urls"], r["doc_name"], r["doc_type"]]
@@ -269,9 +298,19 @@ def build_excel(rows: list[dict], output_path: str):
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
             cell.fill = fill
             cell.alignment = Alignment(wrap_text=True, vertical="top")
+        # attachment hyperlink in column 7
+        doc_path = r.get("doc_path", "")
+        link_cell = ws.cell(row=row_idx, column=7)
+        link_cell.fill = fill
+        if doc_path and os.path.exists(doc_path):
+            file_uri = "file://" + doc_path
+            link_cell.value = os.path.basename(doc_path)
+            link_cell.hyperlink = file_uri
+            link_cell.font = link_font
+        link_cell.alignment = Alignment(wrap_text=True, vertical="top")
 
     # column widths
-    widths = [18, 80, 22, 50, 35, 12]
+    widths = [18, 80, 22, 50, 35, 12, 40]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -319,6 +358,7 @@ def append_to_excel(rows: list[dict], output_path: str):
         build_excel(rows, output_path)
         return
 
+    link_font = Font(color="0000EE", underline="single")
     for r in rows:
         fill = get_fill(r["theme"])
         values = [r["date"], r["text"], r["theme"], r["urls"], r["doc_name"], r["doc_type"]]
@@ -327,6 +367,14 @@ def append_to_excel(rows: list[dict], output_path: str):
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
             cell.fill = fill
             cell.alignment = Alignment(wrap_text=True, vertical="top")
+        doc_path = r.get("doc_path", "")
+        link_cell = ws.cell(row=row_idx, column=7)
+        link_cell.fill = fill
+        if doc_path and os.path.exists(doc_path):
+            link_cell.value = os.path.basename(doc_path)
+            link_cell.hyperlink = "file://" + doc_path
+            link_cell.font = link_font
+        link_cell.alignment = Alignment(wrap_text=True, vertical="top")
 
     # update summary sheet
     from collections import Counter
